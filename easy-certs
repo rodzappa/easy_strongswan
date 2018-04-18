@@ -1,0 +1,275 @@
+#!/bin/bash
+
+ORG_COUNTRY="BR"
+ORG_NAME="COMPANY"
+HOST_NAME="vpn-gw.domain.com"
+
+HOST_ORG="C=$ORG_COUNTRY, O=$ORG_NAME, CN=$HOST_NAME"
+CACERT_ORG="C=$ORG_COUNTRY, O=$ORG_NAME, CN=strongSwan Root CA"
+
+STRONG_HOME="/etc/strongswan"
+CACERT_HOME="$STRONG_HOME/ipsec.d/cacerts"
+CERTS_HOME="$STRONG_HOME/ipsec.d/certs"
+KEYS_HOME="$STRONG_HOME/ipsec.d/private"
+CRLS_HOME="$STRONG_HOME/ipsec.d/crls"
+
+START_DIR=`pwd`
+
+clean() {
+  echo "This precedure is dangerous and will delete all certificates and keys from \"$STRONG_HOME/ipsec.d\" dir and subdirs!!!"
+  read -p "Are you REALLY sure? (Y/N)" -n 1 -r
+  echo " "
+  if [[ ! $REPLY =~ ^[Yy]$ ]]
+  then
+    [[ "$0" = "$BASH_SOURCE" ]] && exit 1 || return 1
+  fi
+
+	echo -e "Cleaning dirs. Wait..." && \
+	cd $STRONG_HOME/ipsec.d && \
+	find ./ -type f -exec rm -f {} \;
+	echo -e "Done!"
+	exit 0
+}
+
+gen_ca() {
+	echo -e "Generating CA Cert. Wait..." && \
+	cd $STRONG_HOME && \
+	
+	strongswan pki \
+	--gen \
+	--type rsa \
+	--size 4096 \
+	--outform der > $KEYS_HOME/strongswanKey.der && \
+
+	chmod 600 $KEYS_HOME/strongswanKey.der && \
+	
+	strongswan pki \
+	--self \
+	--ca \
+	--lifetime 3650 \
+	--in $KEYS_HOME/strongswanKey.der \
+	--type rsa \
+	--digest sha1 \
+	--dn "$CACERT_ORG" \
+	--outform der > $CACERT_HOME/strongswanCert.der && \
+
+	openssl x509 \
+	-inform DER \
+	-in $CACERT_HOME/strongswanCert.der \
+	-out $CACERT_HOME/strongswanCert.crt \
+	-outform PEM
+	
+	echo -e "\nCA Cert output:" && \
+	
+	strongswan pki \
+	--print \
+	--in $CACERT_HOME/strongswanCert.der
+	
+	exit 0
+}
+
+gen_host() {
+	echo -e "Generating host Cert. Wait..." && \
+	cd $STRONG_HOME && \
+	
+	strongswan pki \
+	--gen \
+	--type rsa \
+	--size 2048 \
+	--outform der > $KEYS_HOME/vpnHostKey.der && \
+	
+	chmod 600 $KEYS_HOME/vpnHostKey.der && \
+	
+	strongswan pki \
+	--pub \
+	--in $KEYS_HOME/vpnHostKey.der \
+	--type rsa | \
+
+	strongswan pki \
+	--issue \
+	--lifetime 730 \
+	--cacert $CACERT_HOME/strongswanCert.der \
+	--cakey $KEYS_HOME/strongswanKey.der \
+	--digest sha1 \
+	--dn "$HOST_ORG" \
+	--san $HOST_NAME \
+	--flag serverAuth \
+	--flag ikeIntermediate \
+	--outform der > $CERTS_HOME/vpnHostCert.der && \
+	
+	echo -e "\nHost Cert output:" && \
+	
+	strongswan pki \
+	--print \
+	--in $CERTS_HOME/vpnHostCert.der
+	
+	exit 0
+}
+
+gen_client() {
+	if [ "$#" -ne 2 ]; then
+		echo -e "\nUse $0 client <name> <password>\n"
+		exit 0
+	fi
+
+	NAME=$1
+	PASSWORD=$2
+	ORG="C=BR, O=TNC-GAN, CN=$NAME"
+
+	echo -e "Generating client Cert. Wait..." && \
+	cd $STRONG_HOME && \
+
+	strongswan pki \
+	--gen \
+	--type rsa \
+	--size 2048 \
+	--outform der > $KEYS_HOME/${NAME}.der && \
+	
+	chmod 600 $KEYS_HOME/${NAME}.der && \
+
+	strongswan pki \
+	--pub \
+	--in $KEYS_HOME/${NAME}.der \
+	--type rsa | \
+
+	strongswan pki \
+	--issue \
+	--lifetime 730 \
+	--cacert $CACERT_HOME/strongswanCert.der \
+	--cakey $KEYS_HOME/strongswanKey.der \
+	--digest sha1 \
+	--dn "$ORG" \
+	--san "${NAME}" \
+	--outform der > $CERTS_HOME/${NAME}.der && \
+	
+	openssl rsa \
+	-inform DER \
+	-in $KEYS_HOME/${NAME}.der \
+	-out $KEYS_HOME/${NAME}.key \
+	-outform PEM && \
+	
+	openssl x509 \
+	-inform DER \
+	-in $CERTS_HOME/${NAME}.der \
+	-out $CERTS_HOME/${NAME}.crt \
+	-outform PEM && \
+
+	openssl pkcs12 \
+	-export \
+	-inkey $KEYS_HOME/${NAME}.key \
+	-in $CERTS_HOME/${NAME}.crt \
+	-name "${NAME} certificate" \
+	-certfile $CACERT_HOME/strongswanCert.crt \
+	-caname "strongSwan Root CA" \
+	-out $START_DIR/${NAME}.p12 \
+	-passout pass:"${PASSWORD}" && \
+	
+	mkdir /tmp/$$.certs
+	
+	cp $KEYS_HOME/${NAME}.key /tmp/$$.certs && \
+	cp $CERTS_HOME/${NAME}.crt /tmp/$$.certs && \
+	cp $CACERT_HOME/strongswanCert.crt /tmp/$$.certs/server.crt && \
+	
+	cd /tmp/$$.certs && \
+	tar -jcf $START_DIR/${NAME}.tar.bz2 * && \
+	rm -Rf /tmp/$$.certs && \
+	
+	echo -e "\nClient Cert output: `pwd`/${NAME}.p12" && \
+	
+	openssl pkcs12 \
+	-in $START_DIR/${NAME}.p12 \
+	-nodes \
+	-passin pass:"${PASSWORD}" | \
+	
+	openssl x509 \
+	-noout \
+	-subject && \
+	
+	echo -e "\nDone!"
+	exit 0
+}
+
+revoke() {
+	if [ "$#" -ne 1 ]; then
+		echo -e "\nUse $0 revoke <name>\n"
+		exit 0
+	fi
+  
+  echo "This precedure will revoke and delete all certificates and keys named ${NAME}!!!"
+  read -p "Are you REALLY sure? (Y/N)" -n 1 -r
+  echo " "
+  
+  if [[ ! $REPLY =~ ^[Yy]$ ]]
+  then
+    [[ "$0" = "$BASH_SOURCE" ]] && exit 1 || return 1
+  fi
+
+	NAME=$1
+	
+	echo -e "\nRevoking ${NAME}. Wait..."
+	
+	if [ ! -f "$CERTS_HOME/${NAME}.der" ]; then
+		echo -e "Cert not found: $CERTS_HOME/${NAME}.der. Aborted!\n"
+		exit 0
+	fi
+	
+	if [ ! -f "$CRLS_HOME/crl.der" ]; then
+		strongswan pki \
+		--signcrl \
+		--reason key-compromise \
+		--cacert $CACERT_HOME/strongswanCert.der \
+		--cakey $KEYS_HOME/strongswanKey.der \
+		--cert $CERTS_HOME/${NAME}.der \
+		--outform der > ${CRLS_HOME}/crl.der
+	else
+		cp ${CRLS_HOME}/crl.der ${CRLS_HOME}/crl.der.tmp && \
+		
+		strongswan pki \
+		--signcrl \
+		--reason key-compromise \
+		--cacert $CACERT_HOME/strongswanCert.der \
+		--cakey $KEYS_HOME/strongswanKey.der \
+		--cert $CERTS_HOME/${NAME}.der \
+		--lastcrl ${CRLS_HOME}/crl.der.tmp \
+		--outform der > ${CRLS_HOME}/crl.der && \
+		
+		rm ${CRLS_HOME}/crl.der.tmp 
+	fi
+	
+	rm $CERTS_HOME/${NAME}.der && \
+	rm $CERTS_HOME/${NAME}.crt && \
+	rm $KEYS_HOME/${NAME}.der && \
+	rm $KEYS_HOME/${NAME}.key && \
+	
+	echo -e "Done!"
+	exit 0
+}
+
+if [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; then
+	case "$1" in
+		ca)
+		  gen_ca
+		  ;;
+		host)
+		  gen_host
+		  ;;
+		client)
+		  gen_client $2 $3
+		  ;;
+		clean)
+		  clean
+		  ;;
+		revoke)
+		  revoke $2
+		  ;;
+		*)
+		  echo -e "\nUse $0 <clean|ca|host>"
+		  echo -e "Use $0 client <name> <password>"
+		  echo -e "Use $0 revoke <name>\n"
+		  ;;
+	esac
+else
+	echo -e "\nUse $0 <clean|ca|host>"
+	echo -e "Use $0 client <name> <password>"
+	echo -e "Use $0 revoke <name>\n"
+fi
